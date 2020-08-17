@@ -1,0 +1,249 @@
+---
+title: "README"
+output: github_document
+always_allow_html: true
+---
+## "Sentiment Analysis"
+### "Julian Avila-Jimenez"
+### "16/8/2020"
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = T, message = F, dpi = 180,
+                      fig.width = 8, fig.height = 5)
+
+library(tidyverse)
+library(knitr)
+library(kableExtra)
+```
+
+Build a model for [Animal crossing user reviews TidyTuesday 2020-05-05](https://github.com/rfordatascience/tidytuesday/blob/master/data/2020/2020-05-05/readme.md) for predict the rating from the text of the user reviews.
+
+
+
+### Get the data and initial exploration.
+
+```{r}
+user_reviews <- readr::read_tsv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2020/2020-05-05/user_reviews.tsv')
+
+head(user_reviews, 15)
+
+user_reviews %>%
+  count(grade) %>%
+  ggplot(aes(grade, n)) +
+  geom_col(fill = "midnightblue", alpha = 0.7)+
+  labs(x="", y="",
+       title="Number of reviews by rating")
+
+```
+
+We can see that lots of people give extreme scores in their rewiews, this distribution is nor suitable to make a prediction model so its a good idea to convert this scores to a label and build a model of binary clasification good vs. bad user reviews.
+
+- Explore the structure of the "good" reviews.
+
+```{r}
+user_reviews %>%
+  filter(grade > 8) %>%
+  sample_n(5) %>%
+  pull(text)
+
+```
+
+The reviews have some text problems, Let’s remove at least the final *"Expand"* from the reviews, and create a new categorical `rating` variable.
+
+```{r}
+reviews_parsed <- user_reviews %>%
+  mutate(text = str_remove(text, "Expand$")) %>% #remove the word Expand
+  mutate(rating = case_when(
+    grade > 7 ~ "good", #make a new variable rating, treshold in 7
+    TRUE ~ "bad"
+  ))
+```
+
+Now let's prepare the reviews to make the model, for this we split the `text` column into tokens by user name.
+
+```{r}
+library(tidytext)
+
+words_per_review <- reviews_parsed %>%
+  unnest_tokens(word, text) %>%
+  count(user_name, name = "total_words")
+
+words_per_review %>%
+  ggplot(aes(total_words)) +
+  geom_histogram(fill = "midnightblue", alpha = 0.8)+
+  labs(y="", x= "Total words",
+       title= "Histogram of Number of words")
+```
+
+This distribution of words is not natural, the gap in the midle of the distribution looks very strange and maybe is related to the data adquisition procedure. But the data is never perfect...
+
+---
+
+### Let's build a model
+
+- Split the data into training and test datasets
+```{r}
+library(tidymodels)
+
+set.seed(123)
+review_split <- initial_split(reviews_parsed, strata = rating)
+review_train <- training(review_split)
+review_test <- testing(review_split)
+```
+
+- Preprocess the data
+
+```{r}
+library(textrecipes)
+
+review_rec <- recipe(rating ~ text, data = review_train) %>% #make the recipe
+  step_tokenize(text) %>% #tokenixe text 
+  step_stopwords(text) %>% #remove stopwords
+  step_tokenfilter(text, max_tokens = 500) %>% #filter tokens by frecuency, keep the top 500 most-used tokens
+  step_tfidf(text) %>% #create a Inverted document frecuency. common or rare the word is across all the observations
+  step_normalize(all_predictors()) #Center and scale numeric data
+
+review_prep <- prep(review_rec) #The prep() function is where everything gets evaluated
+
+review_prep
+```
+
+- Specify the model. Here we can set up the model specification for lasso regression with `penalty = tune()` since we don’t yet know the best value for the regularization parameter and `mixture = 1` for lasso. The lasso has proved to be a good baseline for text modeling.
+
+```{r}
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+lasso_wf <- workflow() %>% #use the workflow to manage modeling pipelines more easily
+  add_recipe(review_rec) %>%
+  add_model(lasso_spec)
+
+lasso_wf
+```
+
+- Tune model parameters.
+     
+First, we need a set of possible regularization parameters to try.
+```{r}
+lambda_grid <- grid_regular(penalty(), levels = 40) 
+```
+
+Next, we need a set of resampled data to fit and evaluate all these models.
+```{r}
+set.seed(123)
+review_folds <- bootstraps(review_train, strata = rating)
+review_folds
+```
+
+Implement the tunning
+```{r}
+
+set.seed(2020)
+lasso_grid <- tune_grid(lasso_wf,
+                        resamples = review_folds,
+                        grid = lambda_grid,
+                        metrics = metric_set(roc_auc, ppv, npv) #set the metrics to compute
+)
+```
+
+Once we have our tuning results, we can examine them in detail.
+
+```{r}
+
+lasso_grid %>%
+  collect_metrics() %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", 
+                full_width = F, 
+                position = "left")%>%
+  scroll_box(height = "200px")
+```
+
+
+But i'm a visual person so...
+
+```{r}
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_line(size = 1.5, show.legend = FALSE) +
+  facet_wrap(~.metric) +
+  scale_x_log10()+
+  theme_minimal()
+```
+
+This shows us a lot. We see clearly that AUC and PPV have benefited from the regularization and we could identify the best value of penalty for each of those metrics. The same is not true for NPV.
+
+---
+
+### Final model
+
+Let’s keep our model as is for now, and choose a final model based on AUC. We can use `select_best()` to find the best AUC and then update our workflow `lasso_wf` with this value.
+
+```{r}
+best_auc <- lasso_grid %>%
+  select_best("roc_auc")
+
+best_auc %>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", 
+                full_width = F, 
+                position = "left")
+
+final_lasso <- finalize_workflow(lasso_wf, best_auc) #functions take a list or tibble of tuning parameter values and update objects with those values
+
+final_lasso
+```
+
+This is the tuned workflow.
+
+To find the most important variables we can use the [vip](https://koalaverse.github.io/vip/) package
+
+```{r}
+library(vip)
+
+final_lasso %>% 
+  fit(review_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = best_auc$penalty) %>%
+  group_by(Sign) %>%
+  top_n(20, wt = abs(Importance)) %>%
+  ungroup() %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = str_remove(Variable, "tfidf_text_"),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Sign, scales = "free_y") +
+  labs(y = NULL)+
+  theme_minimal()
+```
+
+---
+
+### Model test.
+
+Finally, let’s return to our test data. The tune package has a function last_fit() which is nice for situations when you have tuned and finalized a model or workflow and want to fit it one last time on your training data and evaluate it on your testing data. You only have to pass this function your finalized model/workflow and your split.
+
+```{r}
+review_final <- last_fit(final_lasso, review_split)
+
+review_final %>%
+  collect_metrics()%>% 
+  kable() %>% 
+  kable_styling(bootstrap_options = "striped", 
+                full_width = F, 
+                position = "left")
+```
+
+No overfit during our tuning process, and the overall accuracy is not bad. Let’s create a confusion matrix for the testing data.
+
+```{r}
+
+review_final %>%
+  collect_predictions() %>%
+  conf_mat(rating, .pred_class)
+```
+Although our overall accuracy isn’t so bad, we find that it is easier to detect the negative reviews than the positive ones.
